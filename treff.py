@@ -261,10 +261,8 @@ def wrap_text(text, line_length=45):
 
 def is_submission_allowed():
     local_time = get_local_time()
-    # Eingabe ist nicht erlaubt von Donnerstag 15:00 Uhr bis Freitag 21:00 Uhr
-    if local_time.weekday() == 3 and local_time.hour >= 15:
-        return False
-    elif local_time.weekday() == 4 and local_time.hour < 21:
+    # Eingabe ist nicht erlaubt von Freitag 12:00 Uhr bis Freitag 21:00 Uhr
+    if local_time.weekday() == 4 and 12 <= local_time.hour < 21:
         return False
     return True
 
@@ -321,7 +319,7 @@ def index():
         </head>
         <body>
             <h2>Das nächste L11 Clubtreffen ist am Freitag, {{ next_meeting }}</h2>
-            <h3>Hier kannst du dich dafür bis Donnerstag um 15Uhr anmelden.</h3>
+            <h3>Hier kannst du dich dafür bis Freitag um 12Uhr anmelden.</h3>
             <h4>Bitte Freitags nachschauen, ob es stattfindet!!!</h4>
             <p class="message {{ 'cancelled' if participant_count < 4 else 'not_cancelled' }}">{{ meeting_message|safe }}</p>
             <p class="message" style="color:red;">{{ error_message }}</p>
@@ -360,7 +358,7 @@ def index():
                 {% endfor %}
             </table>
             <br><br>
-            <p>Entweder das Rufzeichen oder den Namen angeben reicht aus.<br>Jede Person sollte sich selbst an- oder abmelden.<br>Bis Donnerstags 15Uhr hat jeder Zeit dazu.<br>Sind bis zu diesem Zeitpunkt zu wenige Anmeldungen, findet das Clubtreffen nicht statt! Ein Hinweistext wird oben angezeigt.<br>Die Datenbank resettet sich Freitags um 21Uhr, danach sind neue Anmeldungen für die Folgewoche möglich.<br>
+            <p>Entweder das Rufzeichen oder den Namen angeben reicht aus.<br>Jede Person sollte sich selbst an- oder abmelden.<br>Bis Freitags 12Uhr hat jeder Zeit dazu.<br>Sind bis zu diesem Zeitpunkt zu wenige Anmeldungen, findet das Clubtreffen nicht statt! Ein Hinweistext wird oben angezeigt.<br>Die Datenbank resettet sich Freitags um 21Uhr, danach sind neue Anmeldungen für die Folgewoche möglich.<br>
             Fehler bitte wie immer gerne per Mail an mich senden: <a href="mailto:do1ffe@darc.de">do1ffe@darc.de</a><br>
             Vy 73 Erik, DO1FFE - OVV L11
             </p>
