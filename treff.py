@@ -273,6 +273,7 @@ def index():
     meeting_message = ""
     error_message = ""
     participant_count = 0
+    meeting_takes_place = False
 
     if request.method == 'POST':
         name = request.form['name'].upper()
@@ -294,6 +295,7 @@ def index():
     submission_allowed = is_submission_allowed()
 
     if participant_count >= 4:
+        meeting_takes_place = True
         if submission_allowed:
             meeting_message = f"Das Treffen am {next_meeting_date()} findet statt! Es haben sich {participant_count} Personen angemeldet.<br>Bitte trotzdem weiter anmelden, es könnte ja wieder jemand absagen!"
         else:
@@ -318,6 +320,7 @@ def index():
             </style>
         </head>
         <body>
+            <!-- scrape: treffen_findet_statt={{ 'ja' if meeting_takes_place else 'nein' }}; angemeldete_personen={{ participant_count }} -->
             <h2>Das nächste L11 Clubtreffen ist am Freitag, {{ next_meeting }}</h2>
             <h3>Hier kannst du dich dafür bis Freitag um 12Uhr anmelden.</h3>
             <h4>Bitte Freitags nachschauen, ob es stattfindet!!!</h4>
@@ -365,7 +368,7 @@ def index():
             </p>
         </body>
         </html>
-    """, submission_allowed=submission_allowed, next_meeting=next_meeting_date(), meeting_message=meeting_message, error_message=error_message, participant_count=participant_count, participants_with_index=participants_with_index)
+    """, submission_allowed=submission_allowed, next_meeting=next_meeting_date(), meeting_message=meeting_message, error_message=error_message, participant_count=participant_count, participants_with_index=participants_with_index, meeting_takes_place=meeting_takes_place)
 
 @treff.route('/confirm_delete')
 def confirm_delete():
