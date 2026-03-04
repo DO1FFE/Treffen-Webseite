@@ -359,6 +359,7 @@ def index():
             </table>
             <br><br>
             <p>Entweder das Rufzeichen oder den Namen angeben reicht aus.<br>Jede Person sollte sich selbst an- oder abmelden.<br>Bis Freitags 12Uhr hat jeder Zeit dazu.<br>Sind bis zu diesem Zeitpunkt zu wenige Anmeldungen, findet das Clubtreffen nicht statt! Ein Hinweistext wird oben angezeigt.<br>Die Datenbank resettet sich Freitags um 21Uhr, danach sind neue Anmeldungen für die Folgewoche möglich.<br>
+            <strong>I.Weberstr. 28<br>45127 Essen-Mitte<br>(Haus der Begegnung)</strong><br>
             Fehler bitte wie immer gerne per Mail an mich senden: <a href="mailto:do1ffe@darc.de">do1ffe@darc.de</a><br>
             Vy 73 Erik, DO1FFE - OVV L11
             </p>
