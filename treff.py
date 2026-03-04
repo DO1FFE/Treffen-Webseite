@@ -273,8 +273,6 @@ def index():
     meeting_message = ""
     error_message = ""
     participant_count = 0
-    count, participants = db_manager.get_meeting_info()
-    participants_with_index = enumerate(participants, start=1)
 
     if request.method == 'POST':
         name = request.form['name'].upper()
@@ -289,10 +287,12 @@ def index():
         else:
             db_manager.add_entry(name, call_sign)
 
+    participant_count, participants = db_manager.get_meeting_info()
+    participants_with_index = enumerate(participants, start=1)
+
     wrapped_meeting_message = wrap_text(meeting_message)
     submission_allowed = is_submission_allowed()
 
-    participant_count, _ = db_manager.get_meeting_info()
     if participant_count >= 4:
         if submission_allowed:
             meeting_message = f"Das Treffen am {next_meeting_date()} findet statt! Es haben sich {participant_count} Personen angemeldet.<br>Bitte trotzdem weiter anmelden, es könnte ja wieder jemand absagen!"
