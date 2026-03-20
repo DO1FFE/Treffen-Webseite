@@ -321,7 +321,7 @@ def index():
         </head>
         <body>
             <!-- scrape: treffen_findet_statt={{ 'ja' if meeting_takes_place else 'nein' }}; angemeldete_personen={{ participant_count }} -->
-            <h2>Das nächste L11 Clubtreffen ist am Freitag, {{ next_meeting }}</h2>
+            <h2>Das nächste L11 Clubtreffen ist am Freitag, {{ next_meeting }} von 17-21Uhr</h2>
             <h3>Hier kannst du dich dafür bis Freitag um 12Uhr anmelden.</h3>
             <h4>Bitte Freitags nachschauen, ob es stattfindet!!!</h4>
             <p class="message {{ 'cancelled' if participant_count < 4 else 'not_cancelled' }}">{{ meeting_message|safe }}</p>
