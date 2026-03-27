@@ -189,6 +189,9 @@ def next_meeting_date():
         next_friday += timedelta(days=7)  # Nächster Freitag ist in einer Woche
     return next_friday.strftime('%d.%m.%Y')
 
+def aktuelles_jahr():
+    return get_local_time().year
+
 def validate_input(text):
     # Erlaubt leere Eingaben, da entweder Name oder Rufzeichen ausgefüllt sein können
     if text is None or text.strip() == "":
@@ -366,9 +369,14 @@ def index():
             Fehler bitte wie immer gerne per Mail an mich senden: <a href="mailto:do1ffe@darc.de">do1ffe@darc.de</a><br>
             Vy 73 Erik, DO1FFE - OVV L11
             </p>
+            <hr>
+            <footer>
+                <p>© 2024{% if aktuelles_jahr > 2024 %}–{{ aktuelles_jahr }}{% endif %}, Erik Schauer DO1FFE</p>
+                <p><strong>Hinweis:</strong> Alle Daten auf dieser Seite sind streng vertraulich und dürfen nicht auf anderen Plattformen weiterverwendet werden.</p>
+            </footer>
         </body>
         </html>
-    """, submission_allowed=submission_allowed, next_meeting=next_meeting_date(), meeting_message=meeting_message, error_message=error_message, participant_count=participant_count, participants_with_index=participants_with_index, meeting_takes_place=meeting_takes_place)
+    """, submission_allowed=submission_allowed, next_meeting=next_meeting_date(), meeting_message=meeting_message, error_message=error_message, participant_count=participant_count, participants_with_index=participants_with_index, meeting_takes_place=meeting_takes_place, aktuelles_jahr=aktuelles_jahr())
 
 @treff.route('/confirm_delete')
 def confirm_delete():
