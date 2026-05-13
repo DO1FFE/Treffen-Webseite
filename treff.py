@@ -1,450 +1,1179 @@
-from flask import Flask, request, render_template_string, Response, redirect, url_for, send_from_directory
 from datetime import datetime, timedelta
-import logging
+from functools import wraps
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
+import logging
+import os
+import re
 import sqlite3
-import atexit
 import threading
 import time
-import pytz
-import re
-import os
+
 import requests
+from flask import Flask, Response, redirect, render_template_string, request, send_from_directory, url_for
+
+
+ERSTELLUNGSJAHR = 2024
+ZEITZONE = ZoneInfo("Europe/Berlin")
+MINDESTTEILNEHMER = 4
+MAX_EINGABE_LAENGE = 60
+
+RESET_WOCHENTAG = 4  # Freitag (Montag=0, Dienstag=1, ..., Sonntag=6)
+RESET_STUNDE = 21
+RESET_MINUTE = 0
+
+EINGABE_MUSTER = re.compile(r"^[A-Z0-9ÄÖÜẞ\s-]+$", re.IGNORECASE)
+
+
+def logger_einrichten():
+    logger = logging.getLogger("TreffenLogger")
+    logger.setLevel(logging.INFO)
+
+    if not logger.handlers:
+        handler = RotatingFileHandler("treff.log", maxBytes=10000, backupCount=5, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(handler)
+
+    return logger
+
+
+logger = logger_einrichten()
+
+
+def lade_konfiguration(pfad=".pwd"):
+    konfiguration = {}
+
+    if os.path.exists(pfad):
+        with open(pfad, "r", encoding="utf-8") as datei:
+            for zeile in datei:
+                zeile = zeile.strip()
+                if not zeile or zeile.startswith("#") or "=" not in zeile:
+                    continue
+
+                schluessel, wert = zeile.split("=", 1)
+                konfiguration[schluessel.strip()] = wert.strip()
+
+    for schluessel in (
+        "ADMIN_USERNAME",
+        "ADMIN_PASSWORD",
+        "DAPNET_USERNAME",
+        "DAPNET_PASSWORD",
+        "dapnet_username",
+        "dapnet_password",
+    ):
+        if os.environ.get(schluessel):
+            konfiguration[schluessel] = os.environ[schluessel]
+
+    return konfiguration
+
+
+def konfigurationswert(konfiguration, *schluessel):
+    for eintrag in schluessel:
+        wert = konfiguration.get(eintrag)
+        if wert:
+            return wert
+    return None
+
+
+konfiguration = lade_konfiguration()
+ADMIN_BENUTZERNAME = konfigurationswert(konfiguration, "ADMIN_USERNAME")
+ADMIN_PASSWORT = konfigurationswert(konfiguration, "ADMIN_PASSWORD")
+
 
 class DAPNET:
     """
-    Diese Klasse implementiert einen Client für die DAPNET API.
-    Sie ermöglicht das Senden von Nachrichten über das DAPNET-Netzwerk.
+    Client für die DAPNET-API.
+    Nachrichten werden nur gesendet, wenn Zugangsdaten konfiguriert sind.
     """
 
-    def __init__(self, callsign, password, url='http://www.hampager.de:8080/calls'):
-        self.callsign = callsign
-        self.password = password
+    def __init__(self, rufzeichen=None, passwort=None, url="http://www.hampager.de:8080/calls"):
+        self.rufzeichen = rufzeichen
+        self.passwort = passwort
         self.url = url
-        self.headers = {'Content-type': 'application/json'}
+        self.headers = {"Content-type": "application/json"}
 
-    def send_message(self, message, destination_callsign, tx_group, emergency=False):
-        data = {
-            "text": message,
-            "callSignNames": [destination_callsign] if isinstance(destination_callsign, str) else destination_callsign,
-            "transmitterGroupNames": [tx_group] if isinstance(tx_group, str) else tx_group,
-            "emergency": emergency
+    @property
+    def ist_aktiv(self):
+        return bool(self.rufzeichen and self.passwort)
+
+    def sende_nachricht(self, nachricht, ziel_rufzeichen, sendergruppe, notfall=False):
+        if not self.ist_aktiv:
+            logger.info("DAPNET ist nicht konfiguriert; Nachricht wurde nicht gesendet.")
+            return None
+
+        daten = {
+            "text": nachricht,
+            "callSignNames": [ziel_rufzeichen] if isinstance(ziel_rufzeichen, str) else ziel_rufzeichen,
+            "transmitterGroupNames": [sendergruppe] if isinstance(sendergruppe, str) else sendergruppe,
+            "emergency": notfall,
         }
-        response = requests.post(self.url, headers=self.headers, auth=(self.callsign, self.password), json=data)
-        return response
 
-    def log_message(self, message, destination_callsign, transmitter_group, emergency=False):
-        """
-        Sendet eine Logging-Nachricht über das DAPNET-Netzwerk.
+        try:
+            antwort = requests.post(
+                self.url,
+                headers=self.headers,
+                auth=(self.rufzeichen, self.passwort),
+                json=daten,
+                timeout=5,
+            )
+            antwort.raise_for_status()
+            return antwort
+        except requests.RequestException as fehler:
+            logger.warning("DAPNET-Nachricht konnte nicht gesendet werden: %s", fehler)
+            return None
 
-        :param message: Der Inhalt der Nachricht.
-        :param destination_callsign: Das Zielrufzeichen für die Nachricht.
-        :param transmitter_group: Die Transmittergruppe für die Nachricht.
-        :param emergency: Notfall-Flag (Standard False).
-        :return: Das Response-Objekt der HTTP-Anfrage.
-        """
-        return self.send_message(message, destination_callsign, transmitter_group, emergency)
-
-# Admin-Anmeldedaten einlesen aus .pwd Datei
-def load_credentials():
-    with open('.pwd', 'r') as file:
-        lines = file.readlines()
-        credentials = {}
-        for line in lines:
-            key, value = line.strip().split('=')
-            credentials[key] = value
-        return credentials
-
-credentials = load_credentials()
-ADMIN_USERNAME = credentials['ADMIN_USERNAME']
-ADMIN_PASSWORD = credentials['ADMIN_PASSWORD']
-dapnet_client = DAPNET(credentials['dapnet_username'], credentials['dapnet_password'])
+    def logge_nachricht(self, nachricht, ziel_rufzeichen, sendergruppe, notfall=False):
+        return self.sende_nachricht(nachricht, ziel_rufzeichen, sendergruppe, notfall)
 
 
-# Standardmäßige Reset-Zeit (Freitag um 21 Uhr)
-RESET_WEEKDAY = 4  # Freitag (Montag=0, Dienstag=1, ..., Sonntag=6)
-RESET_HOUR = 21
-RESET_MINUTE = 0
+dapnet_client = DAPNET(
+    konfigurationswert(konfiguration, "DAPNET_USERNAME", "dapnet_username"),
+    konfigurationswert(konfiguration, "DAPNET_PASSWORD", "dapnet_password"),
+)
 
 
-# Logger konfigurieren
-def setup_logger():
-    logger = logging.getLogger('TreffenLogger')
-    logger.setLevel(logging.INFO)  # oder DEBUG, WARNING, etc.
+class DatenbankVerwaltung:
+    def __init__(self, datenbank_name="meeting.db"):
+        self.datenbank_name = datenbank_name
+        self.sperre = threading.Lock()
+        self.datenbank_initialisieren()
 
-    # Log-Rotation einrichten, um zu verhindern, dass die Log-Datei zu groß wird
-    handler = RotatingFileHandler('treff.log', maxBytes=10000, backupCount=5)
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(handler)
-    return logger
+    def datenbank_initialisieren(self):
+        with self.sperre, sqlite3.connect(self.datenbank_name) as verbindung:
+            cursor = verbindung.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meetings (
+                    name TEXT NOT NULL DEFAULT '',
+                    call_sign TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            verbindung.commit()
 
-# Logger-Instanz erstellen
-logger = setup_logger()
+    def datenbank_zuruecksetzen(self):
+        with self.sperre, sqlite3.connect(self.datenbank_name) as verbindung:
+            verbindung.execute("DELETE FROM meetings")
+            verbindung.commit()
 
-class DatabaseManager:
-    def __init__(self, db_name='meeting.db'):
-        self.db_name = db_name
-        self.conn = None
-        self.init_db()
+    def eintrag_hinzufuegen(self, name, rufzeichen):
+        with self.sperre, sqlite3.connect(self.datenbank_name) as verbindung:
+            verbindung.execute(
+                "INSERT INTO meetings (name, call_sign) VALUES (?, ?)",
+                (name, rufzeichen),
+            )
+            verbindung.commit()
 
-    def get_connection(self):
-        if not self.conn:
-            self.conn = sqlite3.connect(self.db_name, check_same_thread=False)
-        return self.conn
-
-    def close_connection(self):
-        if self.conn:
-            self.conn.close()
-            self.conn = None
-
-    def init_db(self):
-        conn = self.get_connection()
-        c = conn.cursor()
-        c.execute('CREATE TABLE IF NOT EXISTS meetings (name TEXT, call_sign TEXT)')
-        conn.commit()
-
-    def reset_db(self):
-        with sqlite3.connect(self.db_name) as conn:
-            c = conn.cursor()
-            c.execute('DELETE FROM meetings')
-            conn.commit()
-
-    def add_entry(self, name, call_sign):
-        conn = self.get_connection()
-        c = conn.cursor()
-        c.execute('INSERT INTO meetings (name, call_sign) VALUES (?, ?)', (name, call_sign))
-        conn.commit()
-        logger.info(f'Eintrag hinzugefügt: Rufzeichen: {call_sign}, Name: {name}')
-        dapnet_client.log_message(
-            f'Treff: Eintrag hinzugefügt: Rufzeichen: {call_sign}, Name: {name}',
-            'DO1FFE',
-            'all',
-            False
-        )
-    def delete_entry(self, name, call_sign):
-        conn = self.get_connection()
-        c = conn.cursor()
-        if name and call_sign:
-            # Lösche den Eintrag mit dem genauen Namen UND Rufzeichen
-            c.execute('DELETE FROM meetings WHERE name = ? AND call_sign = ?', (name, call_sign))
-        elif name:
-            # Lösche nur auf Basis des Namens, wenn kein Rufzeichen angegeben ist
-            c.execute('DELETE FROM meetings WHERE name = ?', (name,))
-        elif call_sign:
-            # Lösche nur auf Basis des Rufzeichens, wenn kein Name angegeben ist
-            c.execute('DELETE FROM meetings WHERE call_sign = ?', (call_sign,))
-        conn.commit()
-        logger.info(f'Eintrag gelöscht: Rufzeichen: {call_sign}, Name: {name}')
-        dapnet_client.log_message(
-            f'Treff: Eintrag gelöscht: Rufzeichen: {call_sign}, Name: {name}',
-            'DO1FFE',
-            'all',
-            False
+        logger.info("Eintrag hinzugefügt: Rufzeichen: %s, Name: %s", rufzeichen, name)
+        dapnet_client.logge_nachricht(
+            f"Treff: Eintrag hinzugefügt: Rufzeichen: {rufzeichen}, Name: {name}",
+            "DO1FFE",
+            "all",
+            False,
         )
 
-    def entry_exists(self, name, call_sign):
-        conn = self.get_connection()
-        c = conn.cursor()
-        if name and call_sign:
-            # Überprüfe, ob ein Eintrag mit genau dem gleichen Namen UND Rufzeichen existiert
-            c.execute('SELECT * FROM meetings WHERE name = ? AND call_sign = ?', (name, call_sign))
-        elif name:
-            # Überprüfe nur den Namen, wenn kein Rufzeichen angegeben ist
-            c.execute('SELECT * FROM meetings WHERE name = ?', (name,))
-        elif call_sign:
-            # Überprüfe nur das Rufzeichen, wenn kein Name angegeben ist
-            c.execute('SELECT * FROM meetings WHERE call_sign = ?', (call_sign,))
-        else:
-            # Keine gültige Eingabe
+    def eintrag_loeschen(self, name, rufzeichen):
+        with self.sperre, sqlite3.connect(self.datenbank_name) as verbindung:
+            if name and rufzeichen:
+                verbindung.execute(
+                    "DELETE FROM meetings WHERE name = ? AND call_sign = ?",
+                    (name, rufzeichen),
+                )
+            elif name:
+                verbindung.execute("DELETE FROM meetings WHERE name = ?", (name,))
+            elif rufzeichen:
+                verbindung.execute("DELETE FROM meetings WHERE call_sign = ?", (rufzeichen,))
+            verbindung.commit()
+
+        logger.info("Eintrag gelöscht: Rufzeichen: %s, Name: %s", rufzeichen, name)
+        dapnet_client.logge_nachricht(
+            f"Treff: Eintrag gelöscht: Rufzeichen: {rufzeichen}, Name: {name}",
+            "DO1FFE",
+            "all",
+            False,
+        )
+
+    def eintrag_existiert(self, name, rufzeichen):
+        if not name and not rufzeichen:
             return False
-            
-        return c.fetchone() is not None
 
-    def get_meeting_info(self):
-        conn = self.get_connection()
-        c = conn.cursor()
-        c.execute('SELECT * FROM meetings')
-        participants = c.fetchall()
-        return len(participants), participants
+        abfrage = "SELECT 1 FROM meetings WHERE "
+        werte = ()
 
-    def get_all_entries(self):
-        """
-        Holt alle Einträge aus der Datenbank.
-        """
-        conn = self.get_connection()
-        c = conn.cursor()
-        c.execute('SELECT * FROM meetings')
-        return c.fetchall()
+        if name and rufzeichen:
+            abfrage += "name = ? AND call_sign = ?"
+            werte = (name, rufzeichen)
+        elif name:
+            abfrage += "name = ?"
+            werte = (name,)
+        else:
+            abfrage += "call_sign = ?"
+            werte = (rufzeichen,)
 
-db_manager = DatabaseManager()
+        with self.sperre, sqlite3.connect(self.datenbank_name) as verbindung:
+            cursor = verbindung.execute(f"{abfrage} LIMIT 1", werte)
+            return cursor.fetchone() is not None
 
-def get_local_time():
-    local_timezone = pytz.timezone('Europe/Berlin')  # Setzen Sie hier Ihre lokale Zeitzone
-    return datetime.now(local_timezone)
+    def alle_eintraege(self):
+        with self.sperre, sqlite3.connect(self.datenbank_name) as verbindung:
+            cursor = verbindung.execute(
+                """
+                SELECT name, call_sign
+                FROM meetings
+                ORDER BY rowid ASC
+                """
+            )
+            return cursor.fetchall()
 
-def next_meeting_date():
-    now = get_local_time()
-    next_friday = now + timedelta((4 - now.weekday()) % 7)
-    if now.weekday() == 4 and now.hour >= 21:  # Wenn heute Freitag nach 21 Uhr ist
-        next_friday += timedelta(days=7)  # Nächster Freitag ist in einer Woche
-    return next_friday.strftime('%d.%m.%Y')
+    def treff_informationen(self):
+        teilnehmer = self.alle_eintraege()
+        return len(teilnehmer), teilnehmer
+
+
+datenbank = DatenbankVerwaltung()
+
+
+def aktuelle_zeit():
+    return datetime.now(ZEITZONE)
+
+
+def naechstes_treffen_datum():
+    jetzt = aktuelle_zeit()
+    naechster_freitag = jetzt + timedelta((RESET_WOCHENTAG - jetzt.weekday()) % 7)
+
+    if jetzt.weekday() == RESET_WOCHENTAG and jetzt.hour >= RESET_STUNDE:
+        naechster_freitag += timedelta(days=7)
+
+    return naechster_freitag.strftime("%d.%m.%Y")
+
 
 def aktuelles_jahr():
-    return get_local_time().year
+    return aktuelle_zeit().year
 
-def validate_input(text):
-    # Erlaubt leere Eingaben, da entweder Name oder Rufzeichen ausgefüllt sein können
+
+def copyright_text():
+    jahr = aktuelles_jahr()
+    jahresangabe = str(ERSTELLUNGSJAHR)
+
+    if jahr > ERSTELLUNGSJAHR:
+        jahresangabe = f"{ERSTELLUNGSJAHR} - {jahr}"
+
+    return f"© {jahresangabe} Erik Schauer, do1ffe@darc.de"
+
+
+def server_port():
+    try:
+        return int(os.environ.get("PORT", "8083"))
+    except ValueError:
+        logger.warning("Ungültiger PORT-Wert, verwende 8083.")
+        return 8083
+
+
+def eingabe_ist_gueltig(text):
     if text is None or text.strip() == "":
         return True
 
-    if not re.match(r'^[A-Za-z0-9äöüÄÖÜß\s\-]+$', text):
+    if len(text) > MAX_EINGABE_LAENGE:
         return False
 
-    return True
+    return EINGABE_MUSTER.fullmatch(text) is not None
 
-def authenticate():
-    return Response(
-    'Bitte Anmeldedaten eingeben', 401,
-    {'WWW-Authenticate': 'Basic realm="Login Required"'})
 
-def requires_auth(f):
-    def decorated(*args, **kwargs):
+def eingabe_normalisieren(text):
+    return text.strip().upper()
+
+
+def anmeldung_erforderlich(funktion):
+    @wraps(funktion)
+    def dekorierte_funktion(*args, **kwargs):
+        if not ADMIN_BENUTZERNAME or not ADMIN_PASSWORT:
+            return Response("Der Admin-Zugang ist noch nicht konfiguriert.", 503)
+
         auth = request.authorization
-        if not auth or not (auth.username == ADMIN_USERNAME and auth.password == ADMIN_PASSWORD):
-            return authenticate()
-        return f(*args, **kwargs)
-    return decorated
+        if not auth or not (auth.username == ADMIN_BENUTZERNAME and auth.password == ADMIN_PASSWORT):
+            return Response(
+                "Bitte Anmeldedaten eingeben",
+                401,
+                {"WWW-Authenticate": 'Basic realm="Treffen Admin"'},
+            )
 
-def log_participants_to_file(participants, log_file_path='teilnahmen.log'):
-    """
-    Loggt die Teilnehmer in eine Datei.
-    Verwendet jetzt das aktuelle Datum statt des Datums des nächsten Treffens.
-    """
-    if not participants:
+        return funktion(*args, **kwargs)
+
+    return dekorierte_funktion
+
+
+def teilnehmer_in_datei_loggen(teilnehmer, log_datei_pfad="teilnahmen.log"):
+    if not teilnehmer:
         return
 
-    current_date = get_local_time().strftime('%d.%m.%Y')  # Aktuelles Datum verwenden
+    aktuelles_datum = aktuelle_zeit().strftime("%d.%m.%Y")
 
-    with open(log_file_path, 'a') as file:
-        for name, call_sign in participants:
-            file.write(f"{current_date}, {call_sign}, {name}\n")
+    with open(log_datei_pfad, "a", encoding="utf-8") as datei:
+        for name, rufzeichen in teilnehmer:
+            datei.write(f"{aktuelles_datum}, {rufzeichen}, {name}\n")
 
-def weekly_db_reset():
+
+def woechentlicher_datenbank_reset():
     logger.info("Reset-Thread gestartet.")
+
     while True:
-        now = get_local_time()
-        days_until_reset = (RESET_WEEKDAY - now.weekday()) % 7
-        next_reset = now + timedelta(days=days_until_reset)
-        next_reset = next_reset.replace(hour=RESET_HOUR, minute=RESET_MINUTE, second=0)
-        if next_reset <= now:
-            next_reset += timedelta(days=7)
-        
-        time_to_wait = (next_reset - now).total_seconds()
-        logger.info(f"Nächstes Datenbank-Reset geplant für: {next_reset}")
-        time.sleep(max(time_to_wait, 0))
-        participants = db_manager.get_all_entries()
-        log_participants_to_file(participants)
-        db_manager.reset_db()
-        logger.info("Datenbank wurde zurückgesetzt")
+        jetzt = aktuelle_zeit()
+        tage_bis_reset = (RESET_WOCHENTAG - jetzt.weekday()) % 7
+        naechster_reset = jetzt + timedelta(days=tage_bis_reset)
+        naechster_reset = naechster_reset.replace(
+            hour=RESET_STUNDE,
+            minute=RESET_MINUTE,
+            second=0,
+            microsecond=0,
+        )
 
-def wrap_text(text, line_length=45):
-    words = text.split()
-    lines = []
-    current_line = ""
+        if naechster_reset <= jetzt:
+            naechster_reset += timedelta(days=7)
 
-    for word in words:
-        if len(current_line) + len(word) + 1 <= line_length:
-            current_line += (word + " ")
-        else:
-            lines.append(current_line)
-            current_line = word + " "
+        wartezeit = (naechster_reset - jetzt).total_seconds()
+        logger.info("Nächstes Datenbank-Reset geplant für: %s", naechster_reset)
+        time.sleep(max(wartezeit, 60))
 
-    lines.append(current_line)  # Füge den letzten Textzeile hinzu
-    return "<br>".join(lines).strip()
+        teilnehmer = datenbank.alle_eintraege()
+        teilnehmer_in_datei_loggen(teilnehmer)
+        datenbank.datenbank_zuruecksetzen()
+        logger.info("Datenbank wurde zurückgesetzt.")
 
-def is_submission_allowed():
-    local_time = get_local_time()
-    # Eingabe ist nicht erlaubt von Freitag 12:00 Uhr bis Freitag 21:00 Uhr
-    if local_time.weekday() == 4 and 12 <= local_time.hour < 21:
-        return False
-    return True
+
+def anmeldungen_erlaubt():
+    lokale_zeit = aktuelle_zeit()
+    return not (lokale_zeit.weekday() == RESET_WOCHENTAG and 12 <= lokale_zeit.hour < RESET_STUNDE)
+
+
+def treff_status_text(teilnehmer_anzahl, ist_anmeldung_erlaubt):
+    datum = naechstes_treffen_datum()
+
+    if teilnehmer_anzahl >= MINDESTTEILNEHMER:
+        if ist_anmeldung_erlaubt:
+            return (
+                f"Das Treffen am {datum} findet statt. Es haben sich {teilnehmer_anzahl} Personen angemeldet. "
+                "Bitte trotzdem weiter anmelden, falls wieder jemand absagt."
+            )
+        return f"Das Treffen am {datum} findet statt. Es haben sich {teilnehmer_anzahl} Personen angemeldet."
+
+    if ist_anmeldung_erlaubt:
+        return (
+            f"Das Treffen am {datum} findet wegen zu geringer Beteiligung ({teilnehmer_anzahl} Personen) noch nicht statt. "
+            f"Sobald mindestens {MINDESTTEILNEHMER} Personen angemeldet sind, findet es statt."
+        )
+
+    return (
+        f"Das Treffen am {datum} findet wegen zu geringer Beteiligung ({teilnehmer_anzahl} Personen) nicht statt. "
+        "Vielleicht klappt es nächsten Freitag."
+    )
+
 
 treff = Flask(__name__)
 
-@treff.route('/', methods=['GET', 'POST'])
+
+@treff.route("/", methods=["GET", "POST"])
 def index():
-    meeting_message = ""
-    error_message = ""
-    participant_count = 0
-    meeting_takes_place = False
+    fehler_meldung = ""
 
-    if request.method == 'POST':
-        name = request.form['name'].upper()
-        call_sign = request.form['call_sign'].upper()
+    if request.method == "POST":
+        name = eingabe_normalisieren(request.form.get("name", ""))
+        rufzeichen = eingabe_normalisieren(request.form.get("call_sign", ""))
 
-        if not validate_input(name) or not validate_input(call_sign):
-            error_message = "Ungültige Eingabe. Bitte nur Buchstaben, Zahlen und Bindestriche verwenden."
-        elif not name and not call_sign:
-            error_message = "Bitte mindestens ein Feld ausfüllen."
-        elif db_manager.entry_exists(name, call_sign):
-            return redirect(url_for('confirm_delete', name=name, call_sign=call_sign))
+        if not eingabe_ist_gueltig(name) or not eingabe_ist_gueltig(rufzeichen):
+            fehler_meldung = (
+                "Ungültige Eingabe. Bitte nur Buchstaben, Zahlen, Leerzeichen und Bindestriche verwenden "
+                f"(maximal {MAX_EINGABE_LAENGE} Zeichen)."
+            )
+        elif not name and not rufzeichen:
+            fehler_meldung = "Bitte mindestens Rufzeichen oder Name ausfüllen."
+        elif datenbank.eintrag_existiert(name, rufzeichen):
+            return redirect(url_for("loeschen_bestaetigen", name=name, call_sign=rufzeichen))
         else:
-            db_manager.add_entry(name, call_sign)
+            datenbank.eintrag_hinzufuegen(name, rufzeichen)
 
-    participant_count, participants = db_manager.get_meeting_info()
-    participants_with_index = enumerate(participants, start=1)
+    teilnehmer_anzahl, teilnehmer = datenbank.treff_informationen()
+    teilnehmer_mit_index = list(enumerate(teilnehmer, start=1))
+    ist_anmeldung_erlaubt = anmeldungen_erlaubt()
+    treffen_findet_statt = teilnehmer_anzahl >= MINDESTTEILNEHMER
 
-    wrapped_meeting_message = wrap_text(meeting_message)
-    submission_allowed = is_submission_allowed()
+    return render_template_string(
+        INDEX_TEMPLATE,
+        copyright=copyright_text(),
+        fehler_meldung=fehler_meldung,
+        ist_anmeldung_erlaubt=ist_anmeldung_erlaubt,
+        mindestteilnehmer=MINDESTTEILNEHMER,
+        naechstes_treffen=naechstes_treffen_datum(),
+        status_klasse="status-ok" if treffen_findet_statt else "status-offen",
+        statuskarte_klasse="statuskarte-ok" if treffen_findet_statt else "statuskarte-offen",
+        status_text="Treffen findet statt" if treffen_findet_statt else "Noch zu wenige Zusagen",
+        teilnehmer_anzahl=teilnehmer_anzahl,
+        teilnehmer_mit_index=teilnehmer_mit_index,
+        treffen_findet_statt=treffen_findet_statt,
+        treffen_status=treff_status_text(teilnehmer_anzahl, ist_anmeldung_erlaubt),
+    )
 
-    if participant_count >= 4:
-        meeting_takes_place = True
-        if submission_allowed:
-            meeting_message = f"Das Treffen am {next_meeting_date()} findet statt! Es haben sich {participant_count} Personen angemeldet.<br>Bitte trotzdem weiter anmelden, es könnte ja wieder jemand absagen!"
-        else:
-            meeting_message = f"Das Treffen am {next_meeting_date()} findet statt! Es haben sich {participant_count} Personen angemeldet."
-    else:
-        if submission_allowed:
-            meeting_message = f"Das Treffen am {next_meeting_date()} findet wegen zu geringer Beteiligung ({participant_count} Personen) nicht statt.<br>Sollte sich die Anzahl auf 4 erhöhen, findet es statt."
-        else:
-            meeting_message = f"Das Treffen am {next_meeting_date()} findet wegen zu geringer Beteiligung ({participant_count} Personen) nicht statt.<br>Vielleicht nächsten Freitag!"
 
-    return render_template_string("""
-        <html>
-        <head>
-            <style>
-                body { font-family: Arial, sans-serif; }
-                .cancelled { color: red; }
-                .not_cancelled { color: green; }
-                @media only screen and (max-width: 600px) {
-                    body { font-size: 20px; } /* Größere Schrift für mobile Geräte */
-                    .message { white-space: normal; }
-                }
-            </style>
-        </head>
-        <body>
-            <!-- scrape: treffen_findet_statt={{ 'ja' if meeting_takes_place else 'nein' }}; angemeldete_personen={{ participant_count }} -->
-            <h2>Das nächste L11 Clubtreffen ist am Freitag, {{ next_meeting }} von 17-21Uhr</h2>
-            <h3>Hier kannst du dich dafür bis Freitag um 12Uhr anmelden.</h3>
-            <h4>Bitte Freitags nachschauen, ob es stattfindet!!!</h4>
-            <p class="message {{ 'cancelled' if participant_count < 4 else 'not_cancelled' }}">{{ meeting_message|safe }}</p>
-            <p class="message" style="color:red;">{{ error_message }}</p>
-            <form method="post">
-                <table>
-                    <tr>
-                        <td>Rufzeichen:</td>
-                        <td><input type="text" name="call_sign" {{ 'disabled' if not submission_allowed }}></td>
-                    </tr>
-                    <tr>
-                        <td>Name:</td>
-                        <td><input type="text" name="name" {{ 'disabled' if not submission_allowed }}></td>
-                    </tr>
-                    <tr>
-                    <td colspan="2">&nbsp</td>
-                    </tr>
-                    <tr>
-                        <td colspan="2"><input type="submit" value="Zusagen/Absagen" {{ 'disabled' if not submission_allowed }}></td>
-                    </tr>
-                </table>
-            </form>
-            <br><br>
-            <h2>Teilnehmerliste</h2>
-            <table border="1">
-                <tr>
-                    <th>#</th>
-                    <th>Rufzeichen</th>
-                    <th>Name</th>
-                </tr>
-                {% for index, (name, call_sign) in participants_with_index %}
-                <tr>
-                    <td>{{ index }}</td>
-                    <td>{{ call_sign }}</td>
-                    <td>{{ name }}</td>
-                </tr>
-                {% endfor %}
-            </table>
-            <br><br>
-            <p>Entweder das Rufzeichen oder den Namen angeben reicht aus.<br>Jede Person sollte sich selbst an- oder abmelden.<br>Bis Freitags 12Uhr hat jeder Zeit dazu.<br>Sind bis zu diesem Zeitpunkt zu wenige Anmeldungen, findet das Clubtreffen nicht statt! Ein Hinweistext wird oben angezeigt.<br>Die Datenbank resettet sich Freitags um 21Uhr, danach sind neue Anmeldungen für die Folgewoche möglich.<br>
-            <strong>I.Weberstr. 28<br>45127 Essen-Mitte<br>(Haus der Begegnung)</strong><br>
-            Fehler bitte wie immer gerne per Mail an mich senden: <a href="mailto:do1ffe@darc.de">do1ffe@darc.de</a><br>
-            Vy 73 Erik, DO1FFE - OVV L11
-            </p>
-            <hr>
-            <footer>
-                <p>© 2024{% if aktuelles_jahr > 2024 %}–{{ aktuelles_jahr }}{% endif %}, Erik Schauer DO1FFE</p>
-                <p><strong>Hinweis:</strong> Alle Daten auf dieser Seite sind streng vertraulich und dürfen nicht auf anderen Plattformen weiterverwendet werden.</p>
-            </footer>
-        </body>
-        </html>
-    """, submission_allowed=submission_allowed, next_meeting=next_meeting_date(), meeting_message=meeting_message, error_message=error_message, participant_count=participant_count, participants_with_index=participants_with_index, meeting_takes_place=meeting_takes_place, aktuelles_jahr=aktuelles_jahr())
+@treff.route("/confirm_delete")
+def loeschen_bestaetigen():
+    name = request.args.get("name", "")
+    rufzeichen = request.args.get("call_sign", "")
 
-@treff.route('/confirm_delete')
-def confirm_delete():
-    name = request.args.get('name', '')
-    call_sign = request.args.get('call_sign', '')
-    return render_template_string("""
-        <html>
-        <body>
-            <h2>Eintrag löschen</h2>
-            <p>Möchten Sie den Eintrag für {{ name or call_sign }} löschen?</p>
-            <form action="{{ url_for('delete') }}" method="post">
-                <input type="hidden" name="name" value="{{ name }}">
-                <input type="hidden" name="call_sign" value="{{ call_sign }}">
-                <input type="submit" value="Ja, löschen">
-            </form>
-            <a href="{{ url_for('index') }}">Abbrechen</a>
-        </body>
-        </html>
-    """, name=name, call_sign=call_sign)
+    return render_template_string(
+        LOESCHEN_TEMPLATE,
+        copyright=copyright_text(),
+        name=name,
+        rufzeichen=rufzeichen,
+    )
 
-@treff.route('/delete', methods=['POST'])
-def delete():
-    name = request.form.get('name', '')
-    call_sign = request.form.get('call_sign', '')
-    db_manager.delete_entry(name, call_sign)
-    return redirect(url_for('index'))
 
-@treff.route('/admin')
-@requires_auth
+@treff.route("/delete", methods=["POST"])
+def loeschen():
+    name = request.form.get("name", "")
+    rufzeichen = request.form.get("call_sign", "")
+    datenbank.eintrag_loeschen(name, rufzeichen)
+    return redirect(url_for("index"))
+
+
+@treff.route("/admin")
+@anmeldung_erforderlich
 def admin():
-    count, participants = db_manager.get_meeting_info()
-    participants_with_index = enumerate(participants, start=1)
-    return render_template_string("""
-        <html>
-        <body>
-            <h2>Statistik</h2>
-            <img src="/statistik/teilnahmen_statistik.png" alt="Statistik">
-            <br><br>
-            <h2>Teilnehmerliste</h2>
-            <table border="1">
-                <tr>
-                    <th>#</th>
-                    <th>Rufzeichen</th>
-                    <th>Name</th>
-                </tr>
-                {% for index, (name, call_sign) in participants_with_index %}
-                <tr>
-                    <td>{{ index }}</td>
-                    <td>{{ call_sign }}</td>
-                    <td>{{ name }}</td>
-                </tr>
-                {% endfor %}
-            </table>
-            <br><br>
-            <a href="{{ url_for('index') }}">Hauptseite</a>
-        </body>
-        </html>
-    """, participants_with_index=participants_with_index)
+    _, teilnehmer = datenbank.treff_informationen()
+    teilnehmer_mit_index = list(enumerate(teilnehmer, start=1))
+    statistik_pfad = os.path.join("statistik", "teilnahmen_statistik.png")
 
-# Route für das Ausliefern von Statistiken hinzufügen
-@treff.route('/statistik/<filename>')
+    return render_template_string(
+        ADMIN_TEMPLATE,
+        copyright=copyright_text(),
+        statistik_vorhanden=os.path.exists(statistik_pfad),
+        teilnehmer_mit_index=teilnehmer_mit_index,
+    )
+
+
+@treff.route("/statistik/<filename>")
 def statistik(filename):
-    return send_from_directory('statistik', filename)
+    return send_from_directory("statistik", filename)
 
-if __name__ == '__main__':
-    if not treff.debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        logger.info("******** Hauptprogramm gestartet, starte den Reset-Thread.")
-        db_reset_thread = threading.Thread(target=weekly_db_reset)
+
+SEITEN_CSS = """
+    :root {
+        --hintergrund: #e8e8e8;
+        --flaeche: #ffffff;
+        --flaeche-zart: #fdf4e7;
+        --text: #273d5e;
+        --text-weich: #485a63;
+        --linie: #cfd6db;
+        --akzent: #2aa6da;
+        --akzent-mittel: #0076b5;
+        --akzent-dunkel: #273d5e;
+        --darc-grau: #90989e;
+        --warnung: #c15413;
+        --warnung-dunkel: #8a2d0b;
+        --warnung-flaeche: #fff0e8;
+        --ok: #278a45;
+        --ok-dunkel: #176234;
+        --ok-flaeche: #edf9f0;
+        --sonne: #f7a900;
+        --schatten: 0 22px 60px rgba(39, 61, 94, 0.14);
+    }
+
+    * {
+        box-sizing: border-box;
+    }
+
+    body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        background:
+            linear-gradient(180deg, #ffffff 0%, var(--hintergrund) 46%, #f4f7f9 100%);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.55;
+    }
+
+    a {
+        color: var(--akzent-dunkel);
+        text-decoration: none;
+        font-weight: 700;
+    }
+
+    a:hover {
+        text-decoration: underline;
+    }
+
+    .seitenkopf {
+        padding: 24px clamp(18px, 4vw, 56px) 44px;
+    }
+
+    .kopfleiste,
+    .hero,
+    .bereich,
+    .fusszeile {
+        width: min(1120px, 100%);
+        margin: 0 auto;
+    }
+
+    .kopfleiste {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 46px;
+    }
+
+    .marke {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+    }
+
+    .markenzeichen {
+        display: grid;
+        place-items: center;
+        width: 48px;
+        height: 48px;
+        flex: 0 0 auto;
+        border: 1px solid rgba(42, 166, 218, 0.34);
+        border-radius: 16px;
+        background: linear-gradient(135deg, var(--akzent-dunkel), var(--akzent), var(--akzent-mittel));
+        color: white;
+        font-weight: 900;
+        letter-spacing: 0;
+        box-shadow: 0 14px 34px rgba(39, 61, 94, 0.18);
+    }
+
+    .marke strong {
+        display: block;
+        font-size: 1.02rem;
+    }
+
+    .marke span:last-child {
+        display: block;
+        color: var(--text-weich);
+        font-size: 0.92rem;
+    }
+
+    .nav-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 42px;
+        padding: 0 16px;
+        border: 1px solid rgba(42, 166, 218, 0.35);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.82);
+        box-shadow: 0 10px 28px rgba(39, 61, 94, 0.08);
+    }
+
+    .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 390px);
+        gap: clamp(24px, 5vw, 56px);
+        align-items: end;
+    }
+
+    .hero h1 {
+        max-width: 760px;
+        margin: 0 0 18px;
+        color: var(--akzent);
+        font-size: clamp(2.35rem, 7vw, 5.2rem);
+        line-height: 0.96;
+        letter-spacing: 0;
+    }
+
+    .vorspann {
+        margin: 0 0 18px;
+        color: var(--akzent-dunkel);
+        font-size: 0.84rem;
+        font-weight: 900;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    .hero-text {
+        max-width: 700px;
+        color: var(--text-weich);
+        font-size: clamp(1rem, 2vw, 1.16rem);
+    }
+
+    .statuskarte,
+    .panel,
+    .hinweisbox {
+        border: 1px solid rgba(39, 61, 94, 0.16);
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: var(--schatten);
+        backdrop-filter: blur(16px);
+    }
+
+    .statuskarte {
+        border-radius: 24px;
+        padding: 24px;
+    }
+
+    .statuskarte-offen {
+        border-color: rgba(193, 84, 19, 0.38);
+        background: linear-gradient(135deg, var(--warnung-flaeche), #ffe0d3);
+        color: var(--warnung-dunkel);
+    }
+
+    .statuskarte-ok {
+        border-color: rgba(39, 138, 69, 0.38);
+        background: linear-gradient(135deg, var(--ok-flaeche), #dff4e6);
+        color: var(--ok-dunkel);
+    }
+
+    .statuskopf {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        margin-bottom: 22px;
+    }
+
+    .status-badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 34px;
+        padding: 0 12px;
+        border-radius: 999px;
+        font-size: 0.82rem;
+        font-weight: 900;
+    }
+
+    .status-ok {
+        color: white;
+        background: var(--ok);
+    }
+
+    .status-offen {
+        color: white;
+        background: var(--warnung);
+    }
+
+    .anzahl {
+        display: grid;
+        gap: 2px;
+    }
+
+    .anzahl strong {
+        font-size: 4rem;
+        line-height: 0.9;
+    }
+
+    .anzahl span {
+        color: var(--text-weich);
+        font-weight: 700;
+    }
+
+    .statuskarte-offen .anzahl span,
+    .statuskarte-offen .statuskopf > span:last-child,
+    .statuskarte-offen p {
+        color: var(--warnung-dunkel);
+    }
+
+    .statuskarte-ok .anzahl span,
+    .statuskarte-ok .statuskopf > span:last-child,
+    .statuskarte-ok p {
+        color: var(--ok-dunkel);
+    }
+
+    .statuskarte p {
+        margin: 18px 0 0;
+    }
+
+    main {
+        padding: 0 clamp(18px, 4vw, 56px) 56px;
+    }
+
+    .app-raster {
+        display: grid;
+        grid-template-columns: minmax(300px, 0.88fr) minmax(0, 1.12fr);
+        gap: 24px;
+        align-items: start;
+    }
+
+    .panel {
+        border-radius: 24px;
+        padding: clamp(22px, 4vw, 32px);
+    }
+
+    .panel h2 {
+        margin: 0 0 18px;
+        color: var(--akzent);
+        font-size: clamp(1.35rem, 3vw, 2rem);
+        line-height: 1.12;
+        letter-spacing: 0;
+    }
+
+    .formular {
+        display: grid;
+        gap: 18px;
+    }
+
+    .formular label {
+        display: grid;
+        gap: 8px;
+        color: var(--text-weich);
+        font-weight: 800;
+    }
+
+    .formular input[type="text"] {
+        width: 100%;
+        min-height: 52px;
+        border: 1px solid var(--linie);
+        border-radius: 14px;
+        padding: 0 16px;
+        background: white;
+        color: var(--text);
+        font: inherit;
+        font-weight: 700;
+        outline: none;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .formular input[type="text"]:focus {
+        border-color: var(--akzent);
+        box-shadow: 0 0 0 4px rgba(42, 166, 218, 0.2);
+    }
+
+    .formular input:disabled {
+        cursor: not-allowed;
+        opacity: 0.58;
+    }
+
+    .hauptaktion,
+    .nebenaktion,
+    .warnaktion {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 52px;
+        border: 0;
+        border-radius: 16px;
+        padding: 0 18px;
+        font: inherit;
+        font-weight: 900;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+    }
+
+    .hauptaktion {
+        width: 100%;
+        color: white;
+        background: var(--akzent);
+        box-shadow: 0 16px 32px rgba(39, 61, 94, 0.22);
+    }
+
+    .hauptaktion:hover {
+        background: var(--akzent-mittel);
+        transform: translateY(-1px);
+    }
+
+    .hauptaktion:disabled {
+        cursor: not-allowed;
+        transform: none;
+        opacity: 0.58;
+        box-shadow: none;
+    }
+
+    .nebenaktion,
+    .warnaktion {
+        border: 1px solid var(--linie);
+        background: white;
+        color: var(--text);
+    }
+
+    .warnaktion {
+        border-color: rgba(180, 35, 24, 0.28);
+        color: var(--warnung);
+    }
+
+    .fehler {
+        margin: 0;
+        padding: 12px 14px;
+        border: 1px solid rgba(180, 35, 24, 0.22);
+        border-radius: 14px;
+        background: var(--warnung-flaeche);
+        color: var(--warnung);
+        font-weight: 800;
+    }
+
+    .hinweisbox {
+        margin-top: 18px;
+        border-radius: 18px;
+        padding: 16px;
+        color: var(--text-weich);
+    }
+
+    .hinweisbox strong {
+        color: var(--text);
+    }
+
+    .tabelle-huelle {
+        overflow-x: auto;
+        border: 1px solid var(--linie);
+        border-radius: 18px;
+        background: white;
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+
+    th,
+    td {
+        padding: 14px 16px;
+        text-align: left;
+        border-bottom: 1px solid #e3e7ea;
+        vertical-align: top;
+    }
+
+    th {
+        color: var(--text-weich);
+        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        background: #f4f7f9;
+    }
+
+    tr:last-child td {
+        border-bottom: 0;
+    }
+
+    .nummer {
+        width: 64px;
+        color: var(--text-weich);
+        font-weight: 900;
+    }
+
+    .leer {
+        color: var(--text-weich);
+        text-align: center;
+    }
+
+    .adressblock {
+        display: grid;
+        gap: 4px;
+        margin-top: 12px;
+    }
+
+    .bestaetigung {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+    }
+
+    .dialog {
+        width: min(560px, 100%);
+    }
+
+    .aktionszeile {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 24px;
+    }
+
+    .statistikbild {
+        width: 100%;
+        max-width: 760px;
+        border: 1px solid var(--linie);
+        border-radius: 18px;
+        background: white;
+    }
+
+    .fusszeile {
+        padding: 20px 0 0;
+        color: var(--text-weich);
+        font-size: 0.92rem;
+    }
+
+    .fusszeile p {
+        margin: 6px 0;
+    }
+
+    @media (max-width: 860px) {
+        .hero,
+        .app-raster {
+            grid-template-columns: 1fr;
+        }
+
+        .kopfleiste {
+            align-items: flex-start;
+        }
+
+        .hero h1 {
+            font-size: clamp(2.4rem, 13vw, 4rem);
+        }
+    }
+
+    @media (max-width: 560px) {
+        .seitenkopf {
+            padding-top: 18px;
+        }
+
+        .kopfleiste {
+            flex-direction: column;
+            margin-bottom: 34px;
+        }
+
+        .nav-link {
+            width: 100%;
+        }
+
+        .statuskopf,
+        .aktionszeile {
+            align-items: stretch;
+            flex-direction: column;
+        }
+
+        .panel,
+        .statuskarte {
+            border-radius: 18px;
+        }
+
+        th,
+        td {
+            padding: 12px;
+        }
+    }
+"""
+
+
+INDEX_TEMPLATE = """
+<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>L11 Clubtreffen</title>
+    <style>{{ css|safe }}</style>
+</head>
+<body>
+    <!-- scrape: treffen_findet_statt={{ 'ja' if treffen_findet_statt else 'nein' }}; angemeldete_personen={{ teilnehmer_anzahl }} -->
+    <header class="seitenkopf">
+        <nav class="kopfleiste" aria-label="Hauptnavigation">
+            <a class="marke" href="{{ url_for('index') }}">
+                <span class="markenzeichen">L11</span>
+                <span>
+                    <strong>DARC OV L11</strong>
+                    <span>Clubtreffen Essen</span>
+                </span>
+            </a>
+        </nav>
+
+        <section class="hero">
+            <div class="hero-text">
+                <p class="vorspann">Freitag, {{ naechstes_treffen }} · 17:00 bis 21:00 Uhr</p>
+                <h1>Teilnahme am Clubtreffen</h1>
+                <p>Haus der Begegnung, I. Weberstraße 28, 45127 Essen-Mitte.</p>
+            </div>
+            <aside class="statuskarte {{ statuskarte_klasse }}" aria-label="Aktueller Treffenstatus">
+                <div class="statuskopf">
+                    <span class="status-badge {{ status_klasse }}">{{ status_text }}</span>
+                    <span>mind. {{ mindestteilnehmer }}</span>
+                </div>
+                <div class="anzahl">
+                    <strong>{{ teilnehmer_anzahl }}</strong>
+                    <span>angemeldete Personen</span>
+                </div>
+                <p>{{ treffen_status }}</p>
+            </aside>
+        </section>
+    </header>
+
+    <main>
+        <section class="bereich app-raster">
+            <div class="panel">
+                <h2>Zusagen oder absagen</h2>
+                {% if fehler_meldung %}
+                    <p class="fehler" role="alert">{{ fehler_meldung }}</p>
+                {% endif %}
+                <form class="formular" method="post">
+                    <label>
+                        Rufzeichen
+                        <input type="text" name="call_sign" autocomplete="nickname" {% if not ist_anmeldung_erlaubt %}disabled{% endif %}>
+                    </label>
+                    <label>
+                        Name
+                        <input type="text" name="name" autocomplete="name" {% if not ist_anmeldung_erlaubt %}disabled{% endif %}>
+                    </label>
+                    <button class="hauptaktion" type="submit" {% if not ist_anmeldung_erlaubt %}disabled{% endif %}>
+                        Eintrag speichern
+                    </button>
+                </form>
+
+                <div class="hinweisbox">
+                    <strong>Anmeldeschluss ist Freitag um 12:00 Uhr.</strong>
+                    <p>Rufzeichen oder Name genügt. Wer bereits eingetragen ist, kann den Eintrag über denselben Wert wieder entfernen.</p>
+                    <div class="adressblock">
+                        <span>I. Weberstraße 28</span>
+                        <span>45127 Essen-Mitte</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>Teilnehmerliste</h2>
+                <div class="tabelle-huelle">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th class="nummer">#</th>
+                                <th>Rufzeichen</th>
+                                <th>Name</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for index, (name, rufzeichen) in teilnehmer_mit_index %}
+                                <tr>
+                                    <td class="nummer">{{ index }}</td>
+                                    <td>{{ rufzeichen or '—' }}</td>
+                                    <td>{{ name or '—' }}</td>
+                                </tr>
+                            {% else %}
+                                <tr>
+                                    <td class="leer" colspan="3">Noch keine Anmeldungen vorhanden.</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                <div class="hinweisbox">
+                    <p>Fehler bitte per Mail an <a href="mailto:do1ffe@darc.de">do1ffe@darc.de</a> senden. Vy 73 Erik, DO1FFE - OVV L11</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="fusszeile">
+        <p>{{ copyright }}</p>
+        <p><strong>Hinweis:</strong> Alle Daten auf dieser Seite sind streng vertraulich und dürfen nicht auf anderen Plattformen weiterverwendet werden.</p>
+    </footer>
+</body>
+</html>
+""".replace("{{ css|safe }}", SEITEN_CSS)
+
+
+LOESCHEN_TEMPLATE = """
+<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Eintrag löschen</title>
+    <style>{{ css|safe }}</style>
+</head>
+<body class="bestaetigung">
+    <main class="panel dialog">
+        <p class="vorspann">Eintrag gefunden</p>
+        <h1>Eintrag löschen?</h1>
+        <p>Möchtest du den Eintrag für <strong>{{ name or rufzeichen }}</strong> wirklich löschen?</p>
+        <form action="{{ url_for('loeschen') }}" method="post" class="aktionszeile">
+            <input type="hidden" name="name" value="{{ name }}">
+            <input type="hidden" name="call_sign" value="{{ rufzeichen }}">
+            <button class="warnaktion" type="submit">Ja, löschen</button>
+            <a class="nebenaktion" href="{{ url_for('index') }}">Abbrechen</a>
+        </form>
+        <footer class="fusszeile">
+            <p>{{ copyright }}</p>
+        </footer>
+    </main>
+</body>
+</html>
+""".replace("{{ css|safe }}", SEITEN_CSS)
+
+
+ADMIN_TEMPLATE = """
+<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Treffen Admin</title>
+    <style>{{ css|safe }}</style>
+</head>
+<body>
+    <header class="seitenkopf">
+        <nav class="kopfleiste" aria-label="Hauptnavigation">
+            <a class="marke" href="{{ url_for('index') }}">
+                <span class="markenzeichen">L11</span>
+                <span>
+                    <strong>DARC OV L11</strong>
+                    <span>Administration</span>
+                </span>
+            </a>
+            <a class="nav-link" href="{{ url_for('index') }}">Hauptseite</a>
+        </nav>
+        <section class="hero">
+            <div class="hero-text">
+                <p class="vorspann">Verwaltung</p>
+                <h1>Treffen Admin</h1>
+                <p>Teilnehmer und Statistik im Überblick.</p>
+            </div>
+        </section>
+    </header>
+
+    <main>
+        <section class="bereich app-raster">
+            <div class="panel">
+                <h2>Statistik</h2>
+                {% if statistik_vorhanden %}
+                    <img class="statistikbild" src="{{ url_for('statistik', filename='teilnahmen_statistik.png') }}" alt="Teilnahmen-Statistik">
+                {% else %}
+                    <p class="leer">Noch keine Statistikgrafik vorhanden.</p>
+                {% endif %}
+            </div>
+
+            <div class="panel">
+                <h2>Teilnehmerliste</h2>
+                <div class="tabelle-huelle">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th class="nummer">#</th>
+                                <th>Rufzeichen</th>
+                                <th>Name</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for index, (name, rufzeichen) in teilnehmer_mit_index %}
+                                <tr>
+                                    <td class="nummer">{{ index }}</td>
+                                    <td>{{ rufzeichen or '—' }}</td>
+                                    <td>{{ name or '—' }}</td>
+                                </tr>
+                            {% else %}
+                                <tr>
+                                    <td class="leer" colspan="3">Noch keine Anmeldungen vorhanden.</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="fusszeile">
+        <p>{{ copyright }}</p>
+        <p><strong>Hinweis:</strong> Alle Daten auf dieser Seite sind streng vertraulich und dürfen nicht auf anderen Plattformen weiterverwendet werden.</p>
+    </footer>
+</body>
+</html>
+""".replace("{{ css|safe }}", SEITEN_CSS)
+
+
+if __name__ == "__main__":
+    if not treff.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        logger.info("Hauptprogramm gestartet, starte den Reset-Thread.")
+        db_reset_thread = threading.Thread(
+            target=woechentlicher_datenbank_reset,
+            name="Datenbank-Reset",
+            daemon=True,
+        )
         db_reset_thread.start()
-        atexit.register(lambda: db_reset_thread.join())
-    treff.run(host='0.0.0.0', port=8083, use_reloader=False)
+
+    treff.run(host="0.0.0.0", port=server_port(), use_reloader=False)
