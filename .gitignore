@@ -1,6 +1,7 @@
 .pwd
 meeting.db
 *.log
+*.log.*
 vorschau-*.png
 __pycache__/
 .pytest_cache/
